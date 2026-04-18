@@ -1,0 +1,354 @@
+# ================================================================
+# FICHIER 2/5 : physics.py
+# Simulateur BELDI v3.0 — Well Control IWCF Level 4
+# ================================================================
+# Moteur physique complet. Aucune dépendance PyQt6.
+#
+# NOUVEAUTÉS v3 :
+#   [N1] Montée progressive des pressions (filtre passe-bas)
+#   [N2] Duse 100% ouverte → Pa = 0 bar exact
+#   [N3] Sabot avec position réglable + calcul Psabot + alarme fracture
+#   [N4] Kick automatique si Pf < Pg (statique ET dynamique)
+#   [N5] Pilote auto : cible Pf = Pg+10 bar, limité par Psabot
+# ================================================================
+
+import math
+from constants import (
+    PC_REF_TIGES, PC_REF_ANN, SPM_REF, D_REF,
+    CHOKE_K, MARGE_SECU, ACCEL_FACTOR,
+    PIPE_VOL_STROKES, ANN_VOL_STROKES,
+    Z_DEFAUT, D1_DEFAUT, PG_DEFAUT, SPM_DEFAUT, CHOKE_DEFAUT,
+    SABOT_FROM_BOTTOM, GRADIENT_FRACTURE,
+    PRESSURE_TAU, TIMER_MS
+)
+
+
+class PhysicsEngine:
+    """
+    Moteur de calcul physique du puits.
+
+    Colonnes de fluides :
+        pipe_fluids  : [volume_strokes, densité, est_gaz]  index0=fond
+        ann_fluids   : [volume_strokes, densité, est_gaz]  index0=fond
+    """
+
+    def __init__(self):
+        self.Z  = Z_DEFAUT
+        self.d1 = D1_DEFAUT
+        self.dr = D1_DEFAUT
+        self.Pg = PG_DEFAUT
+        self.formation_active = False
+
+        self.is_pumping  = False
+        self.spm         = 0.0
+        self.choke_open  = CHOKE_DEFAUT
+        self.bop_closed  = False
+
+        self.pipe_vol_total = PIPE_VOL_STROKES
+        self.ann_vol_total  = ANN_VOL_STROKES
+
+        self.pipe_fluids = [[self.pipe_vol_total, self.d1, False]]
+        self.ann_fluids  = [[self.ann_vol_total,  self.d1, False]]
+
+        self.current_d_injection = self.d1
+
+        self.total_strokes     = 0.0
+        self.circulation_phase = 0
+
+        # --- Sabot ---
+        self.sabot_from_bottom   = SABOT_FROM_BOTTOM   # m depuis le fond
+        self.gradient_fracture   = GRADIENT_FRACTURE   # bar/m
+        self.Psabot_max          = 0.0                 # calculé dans compute()
+        self.Psabot_actuel       = 0.0                 # pression actuelle au sabot
+        self.alarme_fracture     = False
+
+        # --- Résultats calculés ---
+        self.Phea   = 0.0
+        self.Phi    = 0.0
+        self.Pci    = 0.0
+        self.Pcea   = 0.0
+        self.Pchoke = 0.0
+        self.Pa     = 0.0
+        self.Pt     = 0.0
+        self.Pf     = 0.0
+        self.PR     = 0.0
+
+        # --- Valeurs affichées (filtrées, montée progressive) ---
+        # [N1] Filtre passe-bas du 1er ordre : alpha = dt/tau
+        self.Pa_display = 0.0
+        self.Pt_display = 0.0
+
+        self.kick_detected = False
+        self.has_gas       = False
+        self._tick         = 0
+        self._kick_cooldown = 0   # ticks avant prochain kick auto
+
+    # ============================================================
+    # A — HYDROSTATIQUE
+    # ============================================================
+
+    def _compute_hydrostatic(self):
+        self.Phea = sum(
+            (s[0] / self.ann_vol_total) * self.Z * s[1] / 10.2
+            for s in self.ann_fluids
+        )
+        self.Phi = sum(
+            (s[0] / self.pipe_vol_total) * self.Z * s[1] / 10.2
+            for s in self.pipe_fluids
+        )
+
+    # ============================================================
+    # B — PERTES DE CHARGE
+    # ============================================================
+
+    def _compute_friction(self):
+        if not self.is_pumping or self.spm <= 0:
+            self.Pci = self.Pcea = self.Pchoke = 0.0
+            return
+
+        avg_d_pipe = (sum(s[0]*s[1] for s in self.pipe_fluids)
+                      / self.pipe_vol_total)
+        avg_d_ann  = (sum(s[0]*s[1] for s in self.ann_fluids)
+                      / self.ann_vol_total)
+
+        q2 = (self.spm / SPM_REF) ** 2
+        self.Pci  = PC_REF_TIGES * (avg_d_pipe / D_REF) * q2
+        self.Pcea = PC_REF_ANN   * (avg_d_ann  / D_REF) * q2
+
+        # [N2] Duse 100% → Pa = 0 bar exact
+        if self.choke_open >= 100.0:
+            self.Pchoke = 0.0
+        elif self.choke_open < 0.5:
+            self.Pchoke = CHOKE_K * q2 * (avg_d_ann / D_REF) * 500.0
+        else:
+            self.Pchoke = (CHOKE_K * q2 * (avg_d_ann / D_REF)
+                           / (self.choke_open ** 1.5))
+
+    # ============================================================
+    # C — PRESSIONS SURFACE ET FOND
+    # ============================================================
+
+    def _compute_pressures(self):
+        if not self.is_pumping:
+            # STATIQUE
+            if self.formation_active and self.kick_detected:
+                self.Pf = self.Pg
+                self.Pa = max(0.0, self.Pf - self.Phea)
+                self.Pt = max(0.0, self.Pf - self.Phi)
+                self.PR = self.Pt
+            else:
+                self.Pa = 0.0
+                self.Pt = 0.0
+                self.Pf = self.Phea
+                self.PR = 0.0
+        else:
+            # DYNAMIQUE
+            self.Pa  = self.Pchoke
+            self.Pf  = self.Phea + self.Pcea + self.Pa
+            self.PR  = self.Pa + self.Pci + self.Pcea + (self.Phea - self.Phi)
+            self.Pt  = self.PR
+
+    # ============================================================
+    # D — FILTRE MONTÉE PROGRESSIVE [N1]
+    # ============================================================
+
+    def _filter_pressures(self, dt_sec):
+        """
+        Filtre passe-bas du 1er ordre pour montée progressive.
+        alpha proche de 1 → réponse rapide
+        alpha proche de 0 → réponse lente
+        tau = PRESSURE_TAU secondes pour atteindre 63%
+        """
+        alpha = min(1.0, dt_sec / PRESSURE_TAU)
+        self.Pa_display += alpha * (self.Pa - self.Pa_display)
+        self.Pt_display += alpha * (self.Pt - self.Pt_display)
+
+        # En statique : retour à 0 aussi progressif
+        if not self.is_pumping and not self.kick_detected:
+            self.Pa_display += alpha * (0.0 - self.Pa_display)
+            self.Pt_display += alpha * (0.0 - self.Pt_display)
+
+    # ============================================================
+    # E — CALCUL SABOT [N3]
+    # ============================================================
+
+    def _compute_sabot(self):
+        """
+        Profondeur sabot = Z - sabot_from_bottom
+        Psabot_max = gradient_fracture × profondeur_sabot
+        Psabot_actuel = pression hydrostatique annulaire à la profondeur sabot
+                      + Pa (contre-pression duse)
+
+        En pratique : Psabot ≈ (Phea × z_sabot/Z) + Pa
+        """
+        z_sabot = max(50.0, self.Z - self.sabot_from_bottom)
+        self.Psabot_max = self.gradient_fracture * z_sabot
+
+        # Pression au sabot = fraction hydrostatique annulaire + Pchoke
+        frac_sabot = z_sabot / self.Z
+        # Densité moyenne de la boue annulaire au niveau du sabot
+        avg_d_ann = (sum(s[0]*s[1] for s in self.ann_fluids)
+                     / self.ann_vol_total)
+        self.Psabot_actuel = avg_d_ann * z_sabot / 10.2 + self.Pa
+
+        self.alarme_fracture = (self.Psabot_actuel > self.Psabot_max)
+
+    # ============================================================
+    # F — KICK AUTOMATIQUE SI Pf < Pg [N4]
+    # ============================================================
+
+    def _check_underbalance(self):
+        """
+        [N4] Si Pf < Pg dans TOUT état (statique ou dynamique),
+        injecter du gaz dans l'annulaire pour simuler la venue.
+        Cooldown de 30 ticks entre chaque injection.
+        """
+        if not self.formation_active:
+            return
+        if self.Pf < self.Pg:
+            self.kick_detected = True
+            if self._kick_cooldown <= 0:
+                vol = 3.0 if self.is_pumping else 6.0
+                self.inject_kick(kick_vol_strokes=vol)
+                self._kick_cooldown = 30
+        if self._kick_cooldown > 0:
+            self._kick_cooldown -= 1
+
+    # ============================================================
+    # G — DÉPLACEMENT FLUIDES
+    # ============================================================
+
+    def _advance_fluids(self, delta_vol):
+        # Injection surface tiges
+        self.pipe_fluids.append([delta_vol, self.current_d_injection, False])
+
+        # Transfert fond tiges → fond annulaire
+        total_pipe = sum(s[0] for s in self.pipe_fluids)
+        overflow   = total_pipe - self.pipe_vol_total
+        while overflow > 0 and self.pipe_fluids:
+            bot = self.pipe_fluids[0]
+            if bot[0] <= overflow:
+                self.ann_fluids.insert(0, bot.copy())
+                overflow -= bot[0]
+                self.pipe_fluids.pop(0)
+            else:
+                trans    = bot.copy()
+                trans[0] = overflow
+                self.ann_fluids.insert(0, trans)
+                bot[0]  -= overflow
+                overflow  = 0
+
+        # Évacuation surface annulaire (duse)
+        self._trim(self.ann_fluids, self.ann_vol_total)
+
+    # ============================================================
+    # H — EXPANSION GAZ (P1V1=P2V2)
+    # ============================================================
+
+    def _expand_gas(self):
+        depth_frac = 0.0
+        for seg in self.ann_fluids:
+            depth_frac += seg[0] / self.ann_vol_total
+            if seg[2]:
+                p_rel     = max(0.05, 1.0 - depth_frac * 0.9)
+                expansion = 1.0 + 0.004 / p_rel
+                seg[0]   *= expansion
+        self._trim(self.ann_fluids, self.ann_vol_total)
+
+    # ============================================================
+    # I — UTILITAIRES
+    # ============================================================
+
+    def _trim(self, fluids, max_vol):
+        total = sum(s[0] for s in fluids)
+        exc   = total - max_vol
+        while exc > 0 and fluids:
+            top = fluids[-1]
+            if top[0] <= exc:
+                exc -= top[0]; fluids.pop()
+            else:
+                top[0] -= exc; exc = 0
+
+    def _merge(self, fluids):
+        i = 0
+        while i < len(fluids) - 1:
+            if (fluids[i][2] == fluids[i+1][2] and
+                    abs(fluids[i][1] - fluids[i+1][1]) < 0.005):
+                fluids[i][0] += fluids[i+1][0]
+                fluids.pop(i+1)
+            else:
+                i += 1
+
+    # ============================================================
+    # J — ACTIONS OPÉRATIONNELLES
+    # ============================================================
+
+    def inject_kick(self, kick_vol_strokes=15.0):
+        self.ann_fluids.insert(0, [kick_vol_strokes, 0.15, True])
+        self._trim(self.ann_fluids, self.ann_vol_total)
+        self.kick_detected = True
+        self.has_gas       = True
+
+    def compute_dr(self):
+        sidpp   = self.Pt
+        self.dr = self.d1 + (sidpp * 10.2 / self.Z) + MARGE_SECU
+        return self.dr
+
+    def static_level_balance(self):
+        if self.is_pumping or (self.kick_detected and self.bop_closed):
+            return 1.0, 1.0
+        avg_d_p = (sum(s[0]*s[1] for s in self.pipe_fluids)
+                   / self.pipe_vol_total)
+        avg_d_a = (sum(s[0]*s[1] for s in self.ann_fluids)
+                   / self.ann_vol_total)
+        if avg_d_p <= 0 or avg_d_a <= 0:
+            return 1.0, 1.0
+        r = avg_d_a / avg_d_p
+        return (min(1.5, max(0.5, 2.0*r/(1.0+r))),
+                min(1.5, max(0.5, 2.0/(1.0+r))))
+
+    # ============================================================
+    # K — BOUCLE PRINCIPALE
+    # ============================================================
+
+    def compute(self, dt_sec=0.1):
+        self._tick += 1
+
+        if self.is_pumping and self.spm > 0:
+            dv = (self.spm / 60.0) * dt_sec * ACCEL_FACTOR
+            self.total_strokes += dv
+            self._advance_fluids(dv)
+            if self.has_gas:
+                self._expand_gas()
+
+        self._merge(self.pipe_fluids)
+        self._merge(self.ann_fluids)
+
+        self._compute_hydrostatic()
+        self._compute_friction()
+        self._compute_pressures()
+        self._filter_pressures(dt_sec)   # [N1]
+        self._compute_sabot()            # [N3]
+        self._check_underbalance()       # [N4]
+
+        self.has_gas = (any(s[2] for s in self.ann_fluids) or
+                        any(s[2] for s in self.pipe_fluids))
+
+        return {
+            'Phea':        self.Phea,
+            'Phi':         self.Phi,
+            'Pci':         self.Pci,
+            'Pcea':        self.Pcea,
+            'Pchoke':      self.Pchoke,
+            'Pa':          self.Pa,
+            'Pt':          self.Pt,
+            'Pf':          self.Pf,
+            'PR':          self.PR,
+            # Valeurs filtrées pour affichage manomètres
+            'Pa_display':  self.Pa_display,
+            'Pt_display':  self.Pt_display,
+            # Sabot
+            'Psabot_max':  self.Psabot_max,
+            'Psabot_act':  self.Psabot_actuel,
+            'alarme_frac': self.alarme_fracture,
+        }
