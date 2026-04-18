@@ -1,0 +1,34 @@
+# ================================================================
+# FICHIER 1/5 : constants.py
+# Simulateur BELDI v3.0 — Well Control IWCF Level 4
+# ================================================================
+
+PC_REF_TIGES = 20.0    # bar  — pertes de charge tiges (ref 30spm, d=1.0)
+PC_REF_ANN   = 10.0    # bar  — pertes de charge annulaire
+SPM_REF      = 30.0    # coups/min de référence
+D_REF        = 1.0     # g/cm³
+
+CHOKE_K      = 4000.0  # constante duse (orifice)
+MARGE_SECU   = 0.05    # g/cm³ marge sécurité sur dr
+
+TIMER_MS     = 100     # ms (10 Hz)
+ACCEL_FACTOR = 10.0    # accélération simulation
+
+PIPE_VOL_STROKES = 150.0
+ANN_VOL_STROKES  = 350.0
+
+Z_DEFAUT         = 2000.0
+D1_DEFAUT        = 1.20
+PG_DEFAUT        = 250.0
+SPM_DEFAUT       = 30.0
+CHOKE_DEFAUT     = 50.0
+
+SABOT_FROM_BOTTOM  = 300.0   # m depuis le fond (position sabot défaut)
+GRADIENT_FRACTURE  = 0.0220  # bar/m (gradient fracture terrain)
+
+PRESSURE_TAU       = 3.0     # s — constante de temps montée manomètres
+
+AUTO_CHOKE_MARGE   = 10.0    # bar au-dessus de Pg
+AUTO_CHOKE_GAIN    = 0.30
+
+GAUGE_MAX_BAR      = 400     # bar — échelle max manomètres
