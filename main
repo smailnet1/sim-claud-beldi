@@ -1,0 +1,292 @@
+# ================================================================
+# FICHIER 5/5 : main.py   ← LANCER CE FICHIER
+# Simulateur BELDI v3.0 — Well Control IWCF Level 4
+# ================================================================
+# NOUVEAUTÉS v3 :
+#   [N1] Montée progressive des manomètres (filtre dans physics.py)
+#   [N2] Duse 100% → Pa = 0 bar exact
+#   [N3] Pilote auto : Pf = Pg+10 bar, limité par Psabot_max
+#   [N4] Kick auto si Pf < Pg (statique ET dynamique)
+#   [N5] Sabot : profondeur + gradient fracture réglables
+#   [N6] Boutons +/- duse dans ControlPanel
+#
+# LANCER :
+#   python main.py
+#
+# PRÉREQUIS :
+#   pip install PyQt6
+# ================================================================
+
+import sys
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QVBoxLayout, QLabel
+from PyQt6.QtCore    import QTimer, Qt
+from PyQt6.QtGui     import QFont
+
+from constants import TIMER_MS, AUTO_CHOKE_MARGE, AUTO_CHOKE_GAIN
+from physics   import PhysicsEngine
+from widgets   import WellCanvas
+from panels    import ControlPanel, DataPanel
+
+
+class SimulatorBeldi(QMainWindow):
+    """
+    Fenêtre principale — Simulateur BELDI v3.0
+
+    Orchestration :
+        PhysicsEngine → calculs physiques (10 Hz)
+        WellCanvas    → schéma puits animé
+        ControlPanel  → commandes opérateur
+        DataPanel     → manomètres + données numériques
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(
+            "Simulateur BELDI v3.0  ——  Well Control  |  IWCF Level 4")
+        self.setGeometry(50, 40, 1340, 830)
+        self.setMinimumSize(1100, 700)
+
+        self.engine            = PhysicsEngine()
+        self.auto_choke_active = False
+        self._sound_ok         = self._check_sound()
+
+        self._build_ui()
+        self._connect_signals()
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(TIMER_MS)
+
+    # ============================================================
+    # A — CONSTRUCTION UI
+    # ============================================================
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setSpacing(8)
+        root.setContentsMargins(6, 6, 6, 6)
+
+        # Colonne gauche : schéma puits
+        left = QVBoxLayout()
+        ttl  = QLabel("Schéma Puits  —  Tube en U")
+        ttl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ttl.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        left.addWidget(ttl)
+        self.canvas = WellCanvas()
+        left.addWidget(self.canvas, 1)
+        root.addLayout(left, 2)
+
+        # Colonne centrale : données
+        self.data_panel = DataPanel()
+        root.addWidget(self.data_panel, 3)
+
+        # Colonne droite : commandes
+        self.ctrl_panel = ControlPanel()
+        root.addWidget(self.ctrl_panel, 2)
+
+    # ============================================================
+    # B — CONNEXIONS SIGNAUX
+    # ============================================================
+
+    def _connect_signals(self):
+        cp = self.ctrl_panel
+        cp.signal_toggle_pump.connect(self._toggle_pump)
+        cp.signal_choke_changed.connect(self._set_choke)
+        cp.signal_density_changed.connect(self._set_density)
+        cp.signal_spm_changed.connect(self._set_spm)
+        cp.signal_depth_changed.connect(self._set_depth)
+        cp.signal_pg_changed.connect(self._set_pg)
+        cp.signal_kick.connect(self._inject_kick)
+        cp.signal_1st_circ.connect(self._1st_circ)
+        cp.signal_2nd_circ.connect(self._2nd_circ)
+        cp.signal_auto_choke.connect(self._set_auto)
+        cp.signal_formation_toggled.connect(self._set_formation)
+        cp.signal_sabot_depth.connect(self._set_sabot)
+        cp.signal_gradient_frac.connect(self._set_gradient)
+
+    # ============================================================
+    # C — CALLBACKS COMMANDES
+    # ============================================================
+
+    def _toggle_pump(self):
+        self.engine.is_pumping = not self.engine.is_pumping
+        self.engine.spm = (self.ctrl_panel.spin_spm.value()
+                           if self.engine.is_pumping else 0.0)
+        self.ctrl_panel.set_pump_state(self.engine.is_pumping)
+
+    def _set_choke(self, v):
+        self.engine.choke_open = v
+
+    def _set_density(self, v):
+        # La densité change pour la boue FUTURE injectée uniquement
+        # La boue déjà dans le puits garde sa densité (gérée par segments)
+        self.engine.current_d_injection = v
+
+    def _set_spm(self, v):
+        if self.engine.is_pumping:
+            self.engine.spm = v
+
+    def _set_depth(self, v):
+        self.engine.Z = v
+        if not self.engine.has_gas:
+            d = self.engine.d1
+            self.engine.pipe_fluids = [[self.engine.pipe_vol_total, d, False]]
+            self.engine.ann_fluids  = [[self.engine.ann_vol_total,  d, False]]
+
+    def _set_pg(self, v):
+        self.engine.Pg = v
+
+    def _set_formation(self, v):
+        self.engine.formation_active = v
+
+    def _inject_kick(self):
+        self.engine.inject_kick()
+
+    def _set_sabot(self, v):
+        """Profondeur sabot depuis le fond (m)."""
+        self.engine.sabot_from_bottom = v
+
+    def _set_gradient(self, v):
+        """Gradient de fracture (bar/m)."""
+        self.engine.gradient_fracture = v
+
+    def _set_auto(self, checked):
+        self.auto_choke_active = checked
+
+    def _1st_circ(self):
+        """1ère circulation : pomper d1, maintenir Pt = SIDPP."""
+        self.engine.circulation_phase   = 1
+        self.engine.current_d_injection = self.engine.d1
+        self.engine.total_strokes       = 0.0
+        self.ctrl_panel.slider_density.blockSignals(True)
+        self.ctrl_panel.slider_density.setValue(int(self.engine.d1 * 100))
+        self.ctrl_panel.slider_density.blockSignals(False)
+        self.ctrl_panel.lbl_density.setText(f"d = {self.engine.d1:.2f} g/cm³")
+        if not self.engine.is_pumping:
+            self._toggle_pump()
+
+    def _2nd_circ(self):
+        """2ème circulation : injecter dr calculé depuis Pt actuel."""
+        self.engine.circulation_phase = 2
+        dr = self.engine.compute_dr()
+        self.engine.current_d_injection = dr
+        self.engine.total_strokes       = 0.0
+        dr_int = min(220, max(100, int(dr * 100)))
+        self.ctrl_panel.slider_density.blockSignals(True)
+        self.ctrl_panel.slider_density.setValue(dr_int)
+        self.ctrl_panel.slider_density.blockSignals(False)
+        self.ctrl_panel.lbl_density.setText(f"d = {dr:.2f} g/cm³")
+        if not self.engine.is_pumping:
+            self._toggle_pump()
+
+    # ============================================================
+    # D — BOUCLE PRINCIPALE (10 Hz)
+    # ============================================================
+
+    def _tick(self):
+        phys = self.engine.compute(TIMER_MS / 1000.0)
+
+        # Pilote auto choke [N3]
+        if self.auto_choke_active and self.engine.is_pumping:
+            self._auto_choke(phys['Pf'], phys['Psabot_max'])
+
+        # Alarme sonore (Windows)
+        if (self.engine.formation_active and phys['Pf'] < self.engine.Pg
+                and self._sound_ok and self.engine._tick % 8 == 0):
+            try:
+                import winsound
+                winsound.Beep(900, 150)
+            except Exception:
+                pass
+
+        # Alarme sonore fracture
+        if phys['alarme_frac'] and self._sound_ok and self.engine._tick % 6 == 0:
+            try:
+                import winsound
+                winsound.Beep(1400, 100)
+            except Exception:
+                pass
+
+        self._refresh(phys)
+
+    # ============================================================
+    # E — PILOTE AUTOMATIQUE [N3]
+    # ============================================================
+
+    def _auto_choke(self, pf: float, psabot_max: float):
+        """
+        Objectif : Pf = Pg + AUTO_CHOKE_MARGE (10 bar)
+        Limite haute : Psabot_actuel ne dépasse pas Psabot_max
+        Si risque fracture → ouvrir la duse immédiatement
+        """
+        # Priorité absolue : éviter la fracture
+        if self.engine.alarme_fracture:
+            new_choke = min(100.0, self.engine.choke_open + 2.0)
+        else:
+            target    = self.engine.Pg + AUTO_CHOKE_MARGE
+            error     = pf - target
+            new_choke = self.engine.choke_open - AUTO_CHOKE_GAIN * error
+
+        new_choke = max(0.0, min(100.0, new_choke))
+        self.engine.choke_open = new_choke
+
+        self.ctrl_panel.slider_choke.blockSignals(True)
+        self.ctrl_panel.slider_choke.setValue(int(new_choke))
+        self.ctrl_panel.slider_choke.blockSignals(False)
+        self.ctrl_panel.lbl_choke.setText(f"Ouverture : {new_choke:.0f} %")
+
+    # ============================================================
+    # F — RAFRAÎCHISSEMENT INTERFACE
+    # ============================================================
+
+    def _refresh(self, phys: dict):
+        pipe_lvl, ann_lvl = self.engine.static_level_balance()
+
+        # Fraction position sabot pour le canvas
+        sabot_frac = self.engine.sabot_from_bottom / max(1.0, self.engine.Z)
+
+        pipe_vis = [
+            [s[0] / self.engine.pipe_vol_total, s[1], s[2]]
+            for s in self.engine.pipe_fluids
+        ]
+        ann_vis = [
+            [s[0] / self.engine.ann_vol_total, s[1], s[2]]
+            for s in self.engine.ann_fluids
+        ]
+
+        self.canvas.update_fluids(
+            pipe_vis, ann_vis, pipe_lvl, ann_lvl,
+            sabot_frac, phys['alarme_frac']
+        )
+        self.data_panel.update_data(phys, self.engine)
+
+    # ============================================================
+    # G — UTILITAIRES
+    # ============================================================
+
+    @staticmethod
+    def _check_sound():
+        try:
+            import winsound
+            return True
+        except ImportError:
+            return False
+
+
+# ================================================================
+# POINT D'ENTRÉE
+# ================================================================
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = SimulatorBeldi()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
