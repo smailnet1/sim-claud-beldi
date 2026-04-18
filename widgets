@@ -1,0 +1,288 @@
+# ================================================================
+# FICHIER 3/5 : widgets.py
+# Simulateur BELDI v3.0 — Well Control IWCF Level 4
+# ================================================================
+# NOUVEAUTÉS v3 :
+#   [N1] Gauge : texte Pt/PR et Pa bien positionné DANS le cadran
+#   [N2] WellCanvas : sabot visible avec trait et label
+#   [N3] WellCanvas : position sabot réglable visuellement
+# ================================================================
+
+import math
+from PyQt6.QtWidgets import QWidget
+from PyQt6.QtCore    import Qt
+from PyQt6.QtGui     import (QPainter, QColor, QPen, QBrush, QFont,
+                              QLinearGradient)
+from constants import GAUGE_MAX_BAR
+
+
+# ================================================================
+# WIDGET 1 : MANOMÈTRE  [N1] Texte bien dans le cadran
+# ================================================================
+
+class Gauge(QWidget):
+    """
+    Manomètre analogique circulaire.
+    - Titre et valeur positionnés DANS le cercle du cadran
+    - Aucun chevauchement avec les graduations extérieures
+    - Aiguille rouge vif si > 80% de la plage
+    """
+
+    def __init__(self, title, max_val=GAUGE_MAX_BAR, parent=None):
+        super().__init__(parent)
+        self.title   = title
+        self.max_val = max_val
+        self.value   = 0.0
+        self.setMinimumSize(150, 180)
+        self.setMaximumSize(180, 200)
+
+    def set_value(self, val):
+        self.value = max(0.0, min(float(val), self.max_val))
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+
+        # Géométrie du cadran
+        margin = 8
+        r = min(W, H) // 2 - margin - 18   # rayon cadran
+        cx = W // 2
+        cy = H // 2 - 4
+
+        # ── Fond dégradé ──
+        grad = QLinearGradient(cx-r, cy-r, cx+r, cy+r)
+        grad.setColorAt(0, QColor(250, 250, 250))
+        grad.setColorAt(1, QColor(210, 210, 215))
+        p.setBrush(QBrush(grad))
+        p.setPen(QPen(QColor(80, 80, 90), 2))
+        p.drawEllipse(cx-r, cy-r, 2*r, 2*r)
+
+        # ── Arc zone verte (0-60%) ──
+        p.setPen(Qt.PenStyle.NoPen)
+        for i_deg in range(int(225 - 0.6*270), 226):
+            a = math.radians(i_deg)
+            p.setPen(QPen(QColor(0, 180, 0, 40), 3))
+            p.drawLine(int(cx+(r-10)*math.cos(a)), int(cy-(r-10)*math.sin(a)),
+                       int(cx+r*math.cos(a)),      int(cy-r*math.sin(a)))
+
+        # ── Arc zone rouge (80-100%) ──
+        for i_deg in range(225, int(225 - 0.8*270) - 1, -1):
+            a = math.radians(i_deg)
+            p.setPen(QPen(QColor(220, 0, 0, 60), 3))
+            p.drawLine(int(cx+(r-10)*math.cos(a)), int(cy-(r-10)*math.sin(a)),
+                       int(cx+r*math.cos(a)),      int(cy-r*math.sin(a)))
+
+        # ── Graduations (10 divisions) ──
+        for i in range(11):
+            ang = math.radians(225 - i * 27)
+            lw = 2 if i % 2 == 0 else 1
+            l1 = r - (9 if i%2==0 else 6)
+            l2 = r
+            p.setPen(QPen(QColor(40, 40, 40), lw))
+            p.drawLine(int(cx+l1*math.cos(ang)), int(cy-l1*math.sin(ang)),
+                       int(cx+l2*math.cos(ang)), int(cy-l2*math.sin(ang)))
+
+            # Valeurs numériques : positionnées à r-22 (dans le cadran)
+            if i % 2 == 0:
+                val_l = int(self.max_val * i / 10)
+                lx = cx + (r-22)*math.cos(ang) - 14
+                ly = cy - (r-22)*math.sin(ang) - 8
+                p.setFont(QFont("Arial", 6))
+                p.setPen(QColor(50, 50, 50))
+                p.drawText(int(lx), int(ly), 28, 14,
+                           Qt.AlignmentFlag.AlignCenter, str(val_l))
+
+        # ── Aiguille ──
+        ratio = (self.value / self.max_val) if self.max_val > 0 else 0.0
+        ang   = math.radians(225 - ratio * 270)
+        ncol  = QColor(210, 0, 0) if ratio > 0.8 else QColor(140, 0, 0)
+        p.setPen(QPen(ncol, 3))
+        nx = cx + (r-14)*math.cos(ang)
+        ny = cy - (r-14)*math.sin(ang)
+        p.drawLine(cx, cy, int(nx), int(ny))
+        # Contre-aiguille courte
+        p.setPen(QPen(ncol, 2))
+        p.drawLine(cx, cy,
+                   int(cx - 8*math.cos(ang)),
+                   int(cy + 8*math.sin(ang)))
+        # Bouton centre
+        p.setBrush(QBrush(QColor(40, 40, 40)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(cx-5, cy-5, 10, 10)
+
+        # ── TEXTE DANS LE CADRAN [N1] ──
+        # Titre : centré dans la moitié basse du cadran
+        p.setPen(QColor(20, 20, 80))
+        p.setFont(QFont("Arial", 7, QFont.Weight.Bold))
+        # Zone texte titre : entre centre et bord bas du cadran
+        title_y = cy + r//3
+        p.drawText(cx - r + 10, title_y, 2*r - 20, 22,
+                   Qt.AlignmentFlag.AlignCenter, self.title)
+
+        # Valeur numérique : juste en dessous du titre
+        p.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        p.setPen(QColor(0, 0, 140))
+        val_y = title_y + 18
+        p.drawText(cx - r + 10, val_y, 2*r - 20, 22,
+                   Qt.AlignmentFlag.AlignCenter, f"{self.value:.1f} bar")
+
+
+# ================================================================
+# WIDGET 2 : SCHÉMA PUITS avec SABOT  [N2][N3]
+# ================================================================
+
+class WellCanvas(QWidget):
+    """
+    Schéma animé du puits (tube en U).
+
+    Nouveautés v3 :
+        - Sabot tracé comme trait épais horizontal sur l'annulaire
+        - Label 'SABOT' + profondeur affiché
+        - Position sabot réglable via sabot_depth_frac (0..1)
+        - Couleur sabot : vert si OK, orange si Psabot proche max
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(240, 500)
+
+        self.pipe_fluids    = []
+        self.annulus_fluids = []
+        self.pipe_level     = 1.0
+        self.annulus_level  = 1.0
+
+        # Position du sabot : fraction depuis le bas (0=fond, 1=surface)
+        # 300m depuis le fond sur 2000m → frac = 300/2000 = 0.15
+        self.sabot_depth_frac = 0.15
+        self.alarme_fracture  = False
+
+        self._anim = 0   # compteur animation bulles
+
+    def update_fluids(self, pipe, annulus, pipe_lvl=1.0, ann_lvl=1.0,
+                      sabot_frac=0.15, alarme_frac=False):
+        self.pipe_fluids      = pipe
+        self.annulus_fluids   = annulus
+        self.pipe_level       = pipe_lvl
+        self.annulus_level    = ann_lvl
+        self.sabot_depth_frac = sabot_frac
+        self.alarme_fracture  = alarme_frac
+        self._anim           += 1
+        self.update()
+
+    def _fluid_color(self, density, is_gas):
+        if is_gas:
+            return QColor(255, 210, 30, 200)
+        t = max(0.0, min(1.0, (density - 1.0) / 1.2))
+        return QColor(int(190-t*130), int(130-t*90), int(70-t*50))
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+
+        p.fillRect(0, 0, W, H, QColor(240, 240, 240))
+
+        mtop = 32
+        mbot = 48
+        wh   = H - mtop - mbot   # hauteur utile du puits
+
+        px   = int(W * 0.07)
+        pw   = int(W * 0.22)
+        ax   = int(W * 0.52)
+        aw   = int(W * 0.36)
+        boty = H - mbot
+
+        # ── Tiges (gauche) ──
+        eff_p = int(wh * min(1.0, self.pipe_level))
+        sy    = boty
+        for frac, dens, is_gas in self.pipe_fluids:
+            sh = max(1, int(frac * eff_p))
+            sy -= sh
+            p.fillRect(px+2, sy, pw-4, sh, self._fluid_color(dens, is_gas))
+            if is_gas and sh > 6:
+                self._bubbles(p, px+2, sy, pw-4, sh)
+
+        # ── Annulaire (droite) ──
+        eff_a = int(wh * min(1.0, self.annulus_level))
+        sy    = boty
+        for frac, dens, is_gas in self.annulus_fluids:
+            sh = max(1, int(frac * eff_a))
+            sy -= sh
+            p.fillRect(ax+2, sy, aw-4, sh, self._fluid_color(dens, is_gas))
+            if is_gas and sh > 6:
+                self._bubbles(p, ax+2, sy, aw-4, sh)
+
+        # ── Contours puits ──
+        p.setPen(QPen(QColor(20, 20, 20), 3))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(px, mtop, pw, wh)
+        p.drawRect(ax, mtop, aw, wh)
+
+        # Fond du U
+        bw = ax - px + aw
+        p.fillRect(px, boty, bw, mbot-8, QColor(140, 95, 55))
+        p.drawRect(px, boty, bw, mbot-8)
+
+        # Trépan (3 dents)
+        tcx = px + bw//2
+        ty  = boty + 4
+        p.setPen(QPen(QColor(210, 210, 210), 2))
+        for dx in [-14, 0, 14]:
+            p.drawLine(tcx+dx, ty, tcx+dx, ty+12)
+
+        # ── SABOT [N2] ──
+        # Position Y du sabot (fraction depuis le fond)
+        sabot_y = boty - int(wh * min(0.99, max(0.01, self.sabot_depth_frac)))
+        scol    = QColor(220, 60, 0) if self.alarme_fracture else QColor(0, 140, 60)
+
+        # Trait horizontal épais sur l'annulaire uniquement
+        p.setPen(QPen(scol, 4))
+        p.drawLine(ax - 6, sabot_y, ax + aw + 6, sabot_y)
+
+        # Petit triangle indicateur (sabot = chaussure)
+        p.setBrush(QBrush(scol))
+        p.setPen(Qt.PenStyle.NoPen)
+        tri_x = ax + aw + 6
+        pts_x = [tri_x, tri_x+10, tri_x+10]
+        pts_y = [sabot_y, sabot_y-6, sabot_y+6]
+        from PyQt6.QtCore import QPoint
+        from PyQt6.QtGui  import QPolygon
+        poly = QPolygon([QPoint(pts_x[i], pts_y[i]) for i in range(3)])
+        p.drawPolygon(poly)
+
+        # Label SABOT
+        p.setPen(scol)
+        f_sab = QFont("Arial", 7, QFont.Weight.Bold)
+        p.setFont(f_sab)
+        p.drawText(ax + aw + 16, sabot_y - 10, 70, 20,
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   "◄ SABOT")
+
+        # ── Légendes ──
+        p.setPen(QColor(20, 20, 20))
+        p.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+        p.drawText(px, 4, pw, 24, Qt.AlignmentFlag.AlignCenter, "TIGES")
+        p.drawText(ax, 4, aw, 24, Qt.AlignmentFlag.AlignCenter, "ANNULAIRE")
+        p.setPen(QColor(230, 230, 230))
+        p.setFont(QFont("Arial", 7))
+        p.drawText(px, boty+14, bw, 16, Qt.AlignmentFlag.AlignCenter, "FOND — TRÉPAN")
+
+        # Ligne duse (surface annulaire)
+        p.setPen(QPen(QColor(0, 80, 200), 2, Qt.PenStyle.DashLine))
+        p.drawLine(ax, mtop+1, ax+aw, mtop+1)
+        p.setPen(QColor(0, 80, 200))
+        p.setFont(QFont("Arial", 7))
+        p.drawText(ax, mtop+2, aw, 12, Qt.AlignmentFlag.AlignRight, "DUSE  ")
+
+    def _bubbles(self, p, x, y, w, h):
+        p.setPen(QPen(QColor(160, 110, 0), 1))
+        p.setBrush(QBrush(QColor(255, 240, 80, 120)))
+        phase = (self._anim * 2) % max(1, h)
+        for ci, bx in enumerate(range(x+4, x+w-4, 10)):
+            for ri, by0 in enumerate(range(y+4, y+h-4, 12)):
+                shift = (phase + ci*6) % max(1, h)
+                by    = y + (by0 - y + shift) % h
+                rb    = 3 + ri % 2
+                p.drawEllipse(bx, by, rb*2, rb*2)
