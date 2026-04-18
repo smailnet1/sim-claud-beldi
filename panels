@@ -1,0 +1,463 @@
+# ================================================================
+# FICHIER 4/5 : panels.py
+# Simulateur BELDI v3.0 — Well Control IWCF Level 4
+# ================================================================
+# NOUVEAUTÉS v3 :
+#   [N1] Boutons +/- à côté du slider duse
+#   [N2] Champs Sabot (profondeur + gradient fracture) dans ControlPanel
+#   [N3] DataPanel : affichage Psabot + alarme fracture
+#   [N4] Alarme fracture clignotante dans DataPanel
+# ================================================================
+
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
+    QPushButton, QGridLayout, QGroupBox, QDoubleSpinBox, QFrame
+)
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui  import QFont
+
+from widgets   import Gauge
+from constants import (GAUGE_MAX_BAR, D1_DEFAUT, Z_DEFAUT,
+                       PG_DEFAUT, SPM_DEFAUT, CHOKE_DEFAUT,
+                       SABOT_FROM_BOTTOM, GRADIENT_FRACTURE)
+
+
+# ================================================================
+# PANNEAU DE COMMANDES
+# ================================================================
+
+class ControlPanel(QWidget):
+    signal_toggle_pump       = pyqtSignal()
+    signal_choke_changed     = pyqtSignal(float)
+    signal_density_changed   = pyqtSignal(float)
+    signal_spm_changed       = pyqtSignal(float)
+    signal_depth_changed     = pyqtSignal(float)
+    signal_pg_changed        = pyqtSignal(float)
+    signal_kick              = pyqtSignal()
+    signal_1st_circ          = pyqtSignal()
+    signal_2nd_circ          = pyqtSignal()
+    signal_auto_choke        = pyqtSignal(bool)
+    signal_formation_toggled = pyqtSignal(bool)
+    signal_sabot_depth       = pyqtSignal(float)   # m depuis le fond
+    signal_gradient_frac     = pyqtSignal(float)   # bar/m
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(280)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(5)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        # ── 1. Bouton Marche/Pause ──
+        self.btn_pump = QPushButton("▶  DÉMARRER POMPE")
+        self.btn_pump.setMinimumHeight(42)
+        self.btn_pump.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        self._sbtn(self.btn_pump, "#2E7D32")
+        self.btn_pump.clicked.connect(self.signal_toggle_pump)
+        layout.addWidget(self.btn_pump)
+
+        # Voyant état
+        self.lbl_state = QLabel("● STATIQUE  —  Pompe arrêtée")
+        self.lbl_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_state.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        self.lbl_state.setStyleSheet(
+            "background:#C62828;color:white;padding:4px;border-radius:4px;")
+        layout.addWidget(self.lbl_state)
+
+        # ── 2. Driller's Method ──
+        grp = QGroupBox("Driller's Method")
+        gl  = QVBoxLayout(); gl.setSpacing(3)
+
+        self.btn_1st = QPushButton("1ère Circulation  (d₁ — Évacuation gaz)")
+        self.btn_1st.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        self._sbtn(self.btn_1st, "#E65100")
+        self.btn_1st.clicked.connect(self.signal_1st_circ)
+        gl.addWidget(self.btn_1st)
+
+        self.btn_2nd = QPushButton("2ème Circulation  (dr — Tuer le puits)")
+        self.btn_2nd.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        self._sbtn(self.btn_2nd, "#0D47A1")
+        self.btn_2nd.clicked.connect(self.signal_2nd_circ)
+        gl.addWidget(self.btn_2nd)
+
+        grp.setLayout(gl)
+        layout.addWidget(grp)
+
+        # ── 3. Paramètres puits ──
+        grp_p = QGroupBox("Paramètres du Puits")
+        gpl   = QGridLayout(); gpl.setSpacing(4)
+
+        gpl.addWidget(QLabel("Profondeur (m TVD):"), 0, 0)
+        self.spin_depth = QDoubleSpinBox()
+        self.spin_depth.setRange(100, 8000); self.spin_depth.setValue(Z_DEFAUT)
+        self.spin_depth.setSingleStep(50); self.spin_depth.setDecimals(0)
+        self.spin_depth.valueChanged.connect(lambda v: self.signal_depth_changed.emit(v))
+        gpl.addWidget(self.spin_depth, 0, 1)
+
+        gpl.addWidget(QLabel("Pompe (spm):"), 1, 0)
+        self.spin_spm = QDoubleSpinBox()
+        self.spin_spm.setRange(0, 120); self.spin_spm.setValue(SPM_DEFAUT)
+        self.spin_spm.setSingleStep(1); self.spin_spm.setDecimals(0)
+        self.spin_spm.valueChanged.connect(lambda v: self.signal_spm_changed.emit(v))
+        gpl.addWidget(self.spin_spm, 1, 1)
+
+        grp_p.setLayout(gpl)
+        layout.addWidget(grp_p)
+
+        # ── 4. Duse (Choke) avec boutons +/- [N1] ──
+        grp_ch = QGroupBox("Duse (Choke)")
+        gcl    = QVBoxLayout(); gcl.setSpacing(3)
+
+        self.lbl_choke = QLabel(f"Ouverture : {int(CHOKE_DEFAUT)} %")
+        self.lbl_choke.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_choke.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        gcl.addWidget(self.lbl_choke)
+
+        # Rangée : bouton −  |  slider  |  bouton +
+        row_ch = QHBoxLayout(); row_ch.setSpacing(4)
+        self.btn_choke_minus = QPushButton("−")
+        self.btn_choke_minus.setFixedSize(32, 32)
+        self.btn_choke_minus.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        self.btn_choke_minus.setStyleSheet(
+            "background:#B71C1C;color:white;border-radius:4px;")
+        self.btn_choke_minus.clicked.connect(lambda: self._step_choke(-1))
+
+        self.slider_choke = QSlider(Qt.Orientation.Horizontal)
+        self.slider_choke.setRange(0, 100)
+        self.slider_choke.setValue(int(CHOKE_DEFAUT))
+        self.slider_choke.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.slider_choke.setTickInterval(10)
+        self.slider_choke.valueChanged.connect(self._on_choke)
+
+        self.btn_choke_plus = QPushButton("+")
+        self.btn_choke_plus.setFixedSize(32, 32)
+        self.btn_choke_plus.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        self.btn_choke_plus.setStyleSheet(
+            "background:#1B5E20;color:white;border-radius:4px;")
+        self.btn_choke_plus.clicked.connect(lambda: self._step_choke(+1))
+
+        row_ch.addWidget(self.btn_choke_minus)
+        row_ch.addWidget(self.slider_choke, 1)
+        row_ch.addWidget(self.btn_choke_plus)
+        gcl.addLayout(row_ch)
+
+        ext = QHBoxLayout()
+        ext.addWidget(QLabel("  FERMÉ 0%"))
+        ext.addStretch()
+        ext.addWidget(QLabel("100% OUVERT  "))
+        gcl.addLayout(ext)
+
+        self.btn_auto = QPushButton("🤖  Pilote Auto Choke  (Pf = Pg+10)")
+        self.btn_auto.setCheckable(True)
+        self.btn_auto.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        self.btn_auto.toggled.connect(self._on_auto)
+        gcl.addWidget(self.btn_auto)
+
+        grp_ch.setLayout(gcl)
+        layout.addWidget(grp_ch)
+
+        # ── 5. Densité boue ──
+        grp_d = QGroupBox("Densité Boue Injectée")
+        gdl   = QVBoxLayout(); gdl.setSpacing(3)
+
+        self.lbl_density = QLabel(f"d = {D1_DEFAUT:.2f} g/cm³")
+        self.lbl_density.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_density.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        gdl.addWidget(self.lbl_density)
+
+        self.slider_density = QSlider(Qt.Orientation.Horizontal)
+        self.slider_density.setRange(100, 220)
+        self.slider_density.setValue(int(D1_DEFAUT * 100))
+        self.slider_density.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.slider_density.setTickInterval(10)
+        self.slider_density.valueChanged.connect(self._on_density)
+        gdl.addWidget(self.slider_density)
+
+        dl = QHBoxLayout()
+        dl.addWidget(QLabel("  1.00")); dl.addStretch()
+        dl.addWidget(QLabel("2.20  "))
+        gdl.addLayout(dl)
+        grp_d.setLayout(gdl)
+        layout.addWidget(grp_d)
+
+        # ── 6. Formation / Gisement ──
+        grp_pg = QGroupBox("Formation / Gisement")
+        gpgl   = QGridLayout(); gpgl.setSpacing(4)
+
+        self.btn_formation = QPushButton("Activer la Formation")
+        self.btn_formation.setCheckable(True)
+        self.btn_formation.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        self.btn_formation.toggled.connect(self._on_formation)
+        gpgl.addWidget(self.btn_formation, 0, 0, 1, 2)
+
+        gpgl.addWidget(QLabel("Pression Pg (bar):"), 1, 0)
+        self.spin_pg = QDoubleSpinBox()
+        self.spin_pg.setRange(0, 1500); self.spin_pg.setValue(PG_DEFAUT)
+        self.spin_pg.setSingleStep(5); self.spin_pg.setDecimals(1)
+        self.spin_pg.valueChanged.connect(lambda v: self.signal_pg_changed.emit(v))
+        gpgl.addWidget(self.spin_pg, 1, 1)
+
+        grp_pg.setLayout(gpgl)
+        layout.addWidget(grp_pg)
+
+        # ── 7. Sabot [N2] ──
+        grp_sab = QGroupBox("Sabot (Shoe)")
+        gsl     = QGridLayout(); gsl.setSpacing(4)
+
+        gsl.addWidget(QLabel("Profondeur depuis fond (m):"), 0, 0)
+        self.spin_sabot = QDoubleSpinBox()
+        self.spin_sabot.setRange(10, 2000)
+        self.spin_sabot.setValue(SABOT_FROM_BOTTOM)
+        self.spin_sabot.setSingleStep(10)
+        self.spin_sabot.setDecimals(0)
+        self.spin_sabot.valueChanged.connect(
+            lambda v: self.signal_sabot_depth.emit(v))
+        gsl.addWidget(self.spin_sabot, 0, 1)
+
+        gsl.addWidget(QLabel("Gradient fracture (bar/m):"), 1, 0)
+        self.spin_grad = QDoubleSpinBox()
+        self.spin_grad.setRange(0.010, 0.040)
+        self.spin_grad.setValue(GRADIENT_FRACTURE)
+        self.spin_grad.setSingleStep(0.001)
+        self.spin_grad.setDecimals(4)
+        self.spin_grad.valueChanged.connect(
+            lambda v: self.signal_gradient_frac.emit(v))
+        gsl.addWidget(self.spin_grad, 1, 1)
+
+        grp_sab.setLayout(gsl)
+        layout.addWidget(grp_sab)
+
+        # ── 8. Kick manuel ──
+        self.btn_kick = QPushButton("💥  Simuler Venue de Gaz (Kick)")
+        self.btn_kick.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        self.btn_kick.setStyleSheet(
+            "background:#B71C1C;color:white;padding:7px;border-radius:5px;")
+        self.btn_kick.clicked.connect(self.signal_kick)
+        layout.addWidget(self.btn_kick)
+
+        layout.addStretch()
+
+    # ── Callbacks ──
+
+    def _on_choke(self, val):
+        self.lbl_choke.setText(f"Ouverture : {val} %")
+        self.signal_choke_changed.emit(float(val))
+
+    def _step_choke(self, delta):
+        """Boutons +/- pour régler la duse pas à pas."""
+        new_val = max(0, min(100, self.slider_choke.value() + delta))
+        self.slider_choke.setValue(new_val)
+
+    def _on_density(self, val):
+        d = val / 100.0
+        self.lbl_density.setText(f"d = {d:.2f} g/cm³")
+        self.signal_density_changed.emit(d)
+
+    def _on_auto(self, checked):
+        self.btn_auto.setText(
+            "🤖  Pilote Auto  ACTIF ✔" if checked
+            else "🤖  Pilote Auto Choke  (Pf = Pg+10)")
+        self.btn_auto.setStyleSheet(
+            "background:#1B5E20;color:white;font-weight:bold;" if checked else "")
+        self.signal_auto_choke.emit(checked)
+
+    def _on_formation(self, checked):
+        self.btn_formation.setText(
+            "✔  Formation ACTIVE" if checked else "Activer la Formation")
+        self.btn_formation.setStyleSheet(
+            "background:#B71C1C;color:white;font-weight:bold;"
+            if checked else "font-weight:bold;")
+        self.signal_formation_toggled.emit(checked)
+
+    def set_pump_state(self, is_pumping):
+        if is_pumping:
+            self.btn_pump.setText("⏸  PAUSE  —  Arrêter Pompe")
+            self._sbtn(self.btn_pump, "#E65100")
+            self.lbl_state.setText("● DYNAMIQUE  —  Pompe en MARCHE")
+            self.lbl_state.setStyleSheet(
+                "background:#1B5E20;color:white;padding:4px;border-radius:4px;font-weight:bold;")
+        else:
+            self.btn_pump.setText("▶  DÉMARRER POMPE")
+            self._sbtn(self.btn_pump, "#2E7D32")
+            self.lbl_state.setText("● STATIQUE  —  Pompe arrêtée")
+            self.lbl_state.setStyleSheet(
+                "background:#C62828;color:white;padding:4px;border-radius:4px;font-weight:bold;")
+
+    @staticmethod
+    def _sbtn(btn, color):
+        btn.setStyleSheet(
+            f"background:{color};color:white;padding:6px;border-radius:5px;")
+
+
+# ================================================================
+# PANNEAU DE DONNÉES
+# ================================================================
+
+class DataPanel(QWidget):
+    """
+    Panneau central : manomètres + tableau de données.
+    Nouveautés v3 :
+        - Affichage Psabot actuel et Psabot max
+        - Alarme fracture clignotante [N4]
+        - Valeurs filtrées (montée progressive) [N3]
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(260)
+        self._blink  = False
+        self._blink2 = False   # clignotement alarme fracture
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(5)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        # Manomètres
+        grp_g = QGroupBox("Manomètres de Surface")
+        gl = QHBoxLayout(); gl.setSpacing(4)
+        self.gauge_pt = Gauge("Pt / PR\n(SIDPP / Refoul.)", GAUGE_MAX_BAR)
+        self.gauge_pa = Gauge("Pa  (SICP)\nAmont Duse",     GAUGE_MAX_BAR)
+        gl.addWidget(self.gauge_pt)
+        gl.addWidget(self.gauge_pa)
+        grp_g.setLayout(gl)
+        layout.addWidget(grp_g)
+
+        # Alarme kick
+        self.lbl_alarm = QLabel("ℹ️  Formation non activée")
+        self.lbl_alarm.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_alarm.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        self.lbl_alarm.setMinimumHeight(34)
+        self.lbl_alarm.setStyleSheet(
+            "background:#455A64;color:white;padding:5px;border-radius:5px;")
+        layout.addWidget(self.lbl_alarm)
+
+        # Alarme fracture [N4]
+        self.lbl_frac = QLabel("✅  Psabot OK — Pas de risque fracture")
+        self.lbl_frac.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_frac.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        self.lbl_frac.setMinimumHeight(28)
+        self.lbl_frac.setStyleSheet(
+            "background:#1B5E20;color:white;padding:4px;border-radius:4px;")
+        layout.addWidget(self.lbl_frac)
+
+        # Données numériques
+        self.lbl_data = QLabel("Initialisation...")
+        self.lbl_data.setFont(QFont("Courier New", 9))
+        self.lbl_data.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Sunken)
+        self.lbl_data.setWordWrap(False)
+        self.lbl_data.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.lbl_data, 1)
+
+        # Compteur strokes
+        grp_s = QGroupBox("Compteur Coups de Pompe")
+        sl = QVBoxLayout()
+        self.lbl_strokes = QLabel("0  strokes")
+        self.lbl_strokes.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_strokes.setFont(QFont("Arial", 15, QFont.Weight.Bold))
+        sl.addWidget(self.lbl_strokes)
+        self.lbl_vol = QLabel("≈ 0.00 m³ pompés")
+        self.lbl_vol.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sl.addWidget(self.lbl_vol)
+        grp_s.setLayout(sl)
+        layout.addWidget(grp_s)
+
+    def update_data(self, phys: dict, engine):
+        # Manomètres : valeurs filtrées (montée progressive) [N1]
+        self.gauge_pt.set_value(phys['Pt_display'])
+        self.gauge_pa.set_value(phys['Pa_display'])
+
+        # ── Alarme kick ──
+        if not engine.formation_active:
+            self._alarm("ℹ️  Formation non activée", "#455A64", False)
+        elif phys['Pf'] < engine.Pg:
+            d = phys['Pf'] - engine.Pg
+            self._blink = not self._blink
+            col = "#B71C1C" if self._blink else "#7B0000"
+            self._alarm(f"⚠️  VENUE !  Pf < Pg  (Δ = {d:.1f} bar)", col, True)
+        else:
+            d = phys['Pf'] - engine.Pg
+            self._alarm(f"✅  CONTRÔLÉ  Pf > Pg  (+{d:.1f} bar)", "#1B5E20", False)
+
+        # ── Alarme fracture [N4] ──
+        if phys['alarme_frac']:
+            self._blink2 = not self._blink2
+            col2 = "#E65100" if self._blink2 else "#BF360C"
+            ps_a = phys['Psabot_act']
+            ps_m = phys['Psabot_max']
+            self.lbl_frac.setText(
+                f"⚠️ RISQUE FRACTURE !  Psabot={ps_a:.0f}  >  Pmax={ps_m:.0f} bar")
+            self.lbl_frac.setStyleSheet(
+                f"background:{col2};color:yellow;"
+                f"padding:4px;border-radius:4px;font-weight:bold;")
+        else:
+            ps_a = phys['Psabot_act']
+            ps_m = phys['Psabot_max']
+            self.lbl_frac.setText(
+                f"✅  Psabot={ps_a:.0f} bar  <  Pmax={ps_m:.0f} bar  — OK")
+            self.lbl_frac.setStyleSheet(
+                "background:#1B5E20;color:white;"
+                "padding:4px;border-radius:4px;font-weight:bold;")
+
+        # ── Tableau de données ──
+        mode  = "DYNAMIQUE" if engine.is_pumping else "STATIQUE "
+        noms  = ["Attente / Détection",
+                 "1ère Circulation  (d1)",
+                 "2ème Circulation  (dr)"]
+        phase = noms[engine.circulation_phase]
+        dr_s  = (f"{engine.dr:.3f} g/cm³"
+                 if abs(engine.dr - engine.d1) > 0.001 else "Non calculée")
+        z_sab = engine.Z - engine.sabot_from_bottom
+
+        sep = "─" * 28
+        txt = (
+            f"Mode      : {mode}\n"
+            f"Phase     : {phase}\n"
+            f"{sep}\n"
+            f"MANOMÈTRES\n"
+            f"  Pt/PR   :{phys['Pt_display']:8.1f} bar\n"
+            f"  Pa(SICP):{phys['Pa_display']:8.1f} bar\n"
+            f"{sep}\n"
+            f"PRESSION FOND\n"
+            f"  Pf      :{phys['Pf']:8.1f} bar\n"
+            f"  Pg      :{engine.Pg:8.1f} bar\n"
+            f"  Pf-Pg   :{phys['Pf']-engine.Pg:+8.1f} bar\n"
+            f"{sep}\n"
+            f"SABOT  (z={z_sab:.0f} m)\n"
+            f"  Psabot  :{phys['Psabot_act']:8.1f} bar\n"
+            f"  Psab max:{phys['Psabot_max']:8.1f} bar\n"
+            f"{sep}\n"
+            f"HYDROSTATIQUE\n"
+            f"  Phi(tg) :{phys['Phi']:8.1f} bar\n"
+            f"  Phea(an):{phys['Phea']:8.1f} bar\n"
+            f"{sep}\n"
+            f"PERTES DE CHARGE\n"
+            f"  Pci(tg) :{phys['Pci']:8.1f} bar\n"
+            f"  Pcea(an):{phys['Pcea']:8.1f} bar\n"
+            f"  P duse  :{phys['Pchoke']:8.1f} bar\n"
+            f"{sep}\n"
+            f"FLUIDES\n"
+            f"  d1      :{engine.d1:.3f} g/cm³\n"
+            f"  d inject:{engine.current_d_injection:.3f} g/cm³\n"
+            f"  dr req. :{dr_s}\n"
+            f"  SPM     :{engine.spm:.0f} cps/min\n"
+            f"  Duse    :{engine.choke_open:.0f} %\n"
+        )
+        self.lbl_data.setText(txt)
+
+        self.lbl_strokes.setText(f"{int(engine.total_strokes)}  strokes")
+        vol = engine.total_strokes * 0.030
+        self.lbl_vol.setText(f"≈ {vol:.2f} m³ pompés")
+
+    def _alarm(self, text, bg, blink):
+        self.lbl_alarm.setText(text)
+        tc  = "yellow" if blink else "white"
+        fsz = "11px"   if blink else "10px"
+        self.lbl_alarm.setStyleSheet(
+            f"background:{bg};color:{tc};padding:5px;"
+            f"border-radius:5px;font-size:{fsz};font-weight:bold;")
